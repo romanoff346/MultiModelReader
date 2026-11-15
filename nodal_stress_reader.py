@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import argparse
 import os
-import re
 import sys
 import time
 import warnings
@@ -52,93 +51,67 @@ STRESS_LABELS = ["SX", "SY", "SZ", "SXY", "SYZ", "SXZ"]
 # ---------------------------------------------------------------------------
 
 def read_components_from_archive(cdb_path: str) -> dict[str, np.ndarray]:
-    """Разбирает блоки '*CM,NAME,N,nval,offset' из архива/CDB (MapdlBinaryReader).
+    """Разбирает блоки '*CM,NAME,N,...' из архива/CDB модели.
 
-    Быстро: только header/table1/table2, без триangulation/VTK.
+    Совместимо со всеми версиями pymapdl-reader: используется публичный класс
+    ``Archive`` (ansys-mapdl-core 0.6.x / reader 0.28+, ANSYS 2022 R2) и
+    запасной вариант ``MapdlBinaryReader`` для очень старых версий.
+    Чтение быстрое: parse_vtk=False — без построения VTK-сетки.
     """
-    from ansys.mapdl.reader.mesh import MapdlBinaryReader
+    comps_raw = elem_raw = None
+    try:
+        from ansys.mapdl.reader.archive import Archive
+        arc = Archive(cdb_path, parse_vtk=False)
+        comps_raw, elem_raw = arc.node_components, arc.element_components
+    except ImportError:  # очень старые версии reader (<0.28)
+        from ansys.mapdl.reader.mesh import MapdlBinaryReader
+        reader = MapdlBinaryReader(cdb_path)
+        comps_raw, elem_raw = reader._node_comps, reader._elem_comps
 
-    reader = MapdlBinaryReader(cdb_path)
     comps = {}
-    for name, nodes in reader._node_comps.items():
+    for name, nodes in comps_raw.items():
         key = name.strip().upper()
         if key:
             comps[key] = np.asarray(nodes, dtype=np.int32)
     elem_comps = {k.strip().upper(): np.asarray(v, dtype=np.int32)
-                  for k, v in reader._elem_comps.items()}
+                  for k, v in (elem_raw or {}).items()}
     read_components_from_archive.element_components = elem_comps
     return comps
 
 
-def _load_tables(rst_path: str) -> tuple[bytes, bytes]:
-    """Читает table1/table2 RST-файла напрямую (без Mesh/VTK)."""
-    ext = os.path.splitext(rst_path)[1].lower()
-    d = os.path.dirname(os.path.abspath(rst_path))
-    stem = os.path.splitext(os.path.basename(rst_path))[0]
-    if ext == ".rst":
-        names = ["fileh", stem + "h", "file.h"]
-    else:  # .rnn
-        names = ["filenn", stem + "nn", "file.nn"]
-    table1 = next((os.path.join(d, n) for n in names
-                   if os.path.isfile(os.path.join(d, n))), None)
-    if table1 is None:
-        raise FileNotFoundError(
-            f"Не найден файл таблиц '{names[0]}' рядом с {rst_path}")
-    table2 = table1[:-1] + "2"
-    with open(table1, "rb") as f:
-        data1 = f.read()
-    data2 = b""
-    if os.path.isfile(table2):
-        with open(table2, "rb") as f:
-            data2 = f.read()
-    return data1, data2
-
-
-_CM_RE = re.compile(rb"\*CM,(.{0,90})")
-
-
 def read_components_from_rst(rst_path: str) -> dict[str, np.ndarray]:
-    """Name selections прямо из заголовков RST (таблица геометрии, record 1).
+    """Name selections из таблицы геометрии RST (ptrCOMP/maxcomp).
 
-    Возвращает {} если модель была сохранена без компонентов (CMSflg=0).
+    Реализация опирается только на стабильные внутренние API pymapdl-reader
+    (Result.read_record / _geometry_header / _read_components), которые
+    одинаковы во всех версиях, поддерживающих компоненты в RST (~ANSYS 194+;
+    полноценно — с MAPDL 2021+, включая 2022 R2). Возвращает {} если модель
+    сохранена без компонентов (CMSflg=0) или файл слишком старый.
     """
+    from ansys.mapdl.reader.rst import Result
+
+    t0 = time.perf_counter()
+    res = Result(rst_path, read_mesh=False, parse_vtk=False)
     try:
-        data1, data2 = _load_tables(rst_path)
-    except FileNotFoundError:
-        return {}
-    if b"*CM," not in data1:
-        return {}
+        maxcomp = int(res._geometry_header.get("maxcomp", 0) or 0)
+        if maxcomp <= 0:
+            read_components_from_rst.element_components = {}
+            return {}
+        node_comp, elem_comp = res._read_components()
+    finally:
+        res._file.close()  # не держим дескриптор/память
+    print(f"[тайминг] чтение CM из RST ({maxcomp} записей): "
+          f"{(time.perf_counter()-t0)*1e3:.0f} мс")
 
-    node_comps: dict[str, list[int]] = {}
-    elem_comps: dict[str, list[int]] = {}
-    for match in _CM_RE.finditer(data1):
-        raw = match.group(1).split(b",")
-        if len(raw) < 4:
-            continue
-        name = raw[0].decode("utf-8", "ignore").strip().upper()
-        ctype = raw[1].decode("utf-8", "ignore").strip().upper()
-        try:
-            nval, offset = int(raw[2]), int(raw[3])
-        except ValueError:
-            continue
-        if not name or nval <= 0 or not data2:
-            continue
-        tag = f"<{offset}N<".encode()
-        start = data2.find(tag)
-        if start == -1:
-            continue
-        start += len(tag)
-        end = data2.find(b">>", start)
-        if end == -1:
-            end = min(start + 4 * nval, len(data2))
-        values = np.frombuffer(data2[start:end], dtype="<i4")
-        target = node_comps if ctype == "N" else elem_comps if ctype == "E" else None
-        if target is not None:
-            target.setdefault(name, []).extend(values.tolist())
-
+    comps = {}
+    for name, nodes in node_comp.items():
+        key = name.strip().upper()
+        if key:
+            comps[key] = np.asarray(nodes, dtype=np.int32)
     read_components_from_rst.element_components = {
-        k: np.array(v, dtype=np.int32) for k, v in elem_comps.items()}
-    return {k: np.array(v, dtype=np.int32) for k, v in node_comps.items()}
+        k.strip().upper(): np.asarray(v, dtype=np.int32)
+        for k, v in elem_comp.items() if k.strip()}
+    return comps
 
 
 def gather_components(rst_path: str, archive: str | None,
@@ -171,7 +144,15 @@ def gather_components(rst_path: str, archive: str | None,
 # ---------------------------------------------------------------------------
 
 def open_result(rst_path: str) -> Result:
-    """Открывает RST: mesh нужен для фильтрации узлов, VTK-разбор отключён."""
+    """Открывает RST максимально быстро: mesh читается, VTK-разбор отключён.
+
+    В ansys-mapdl-reader (все версии, включая 2022 R2 / reader 0.28+) фильтр
+    `nodes=` в nodal_stress опирается на VTK-сетку, построение которой на
+    больших моделях занимает минуты. Поэтому напряжения читаются полным
+    массивом ENS и фильтруются векторизованным numpy — это быстрее любого
+    VTK-пути. Если в установленной версии полный ENS без VTK недоступен
+    (AttributeError), автоматически включается parse_vtk=True.
+    """
     t0 = time.perf_counter()
     res = Result(rst_path, read_mesh=True, parse_vtk=False)
     print(f"[тайминг] открытие RST (mesh без VTK): "
@@ -181,15 +162,29 @@ def open_result(rst_path: str) -> Result:
 
 def extract_stresses(res: Result, rnum: int,
                      node_numbers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Напряжения [n,6] только для узлов component (фильтр nodes= в Cython).
+    """Напряжения [n,6] только для узлов name selection (векторный numpy-фильтр).
 
-    Возвращает (nnum, stress). Сортировка узлов component → ускорение кэша.
+    Чтение полного ENS идёт напрямую через Cython-ридер без триангуляции/VTK;
+    выборка узлов — O(N) searchsorted. Возвращает (nnum, stress).
     """
     sel = np.unique(node_numbers.astype(np.int32))
     t0 = time.perf_counter()
-    nnum, stress = res.nodal_stress(rnum, nodes=sel)
-    print(f"[тайминг] извлечение напряжений ({sel.size} узлов): "
-          f"{(time.perf_counter()-t0)*1e3:.0f} мс")
+    try:
+        nnum_all, stress_all = res.nodal_stress(rnum)
+    except AttributeError:
+        # очень старые версии reader: ENS без VTK-грида не читается
+        print("[предупреждение] быстрый путь недоступен в этой версии "
+              "ansys-mapdl-reader, включаю разбор VTK...")
+        nnum, stress = res.nodal_stress(rnum, nodes=sel)
+        print(f"[тайминг] извлечение напряжений через VTK ({sel.size} узлов): "
+              f"{(time.perf_counter()-t0)*1e3:.0f} мс")
+        return nnum, stress
+    # узлы решения отсортированы по номеру → быстрая выборка
+    found = sel[np.isin(sel, nnum_all)]
+    idx = np.searchsorted(nnum_all, found)
+    nnum, stress = nnum_all[idx], stress_all[idx]
+    print(f"[тайминг] извлечение напряжений ({sel.size} узлов выбрано, "
+          f"{nnum.size} с данными): {(time.perf_counter()-t0)*1e3:.0f} мс")
     return nnum, stress
 
 
@@ -211,6 +206,22 @@ def principal_stresses(stress: np.ndarray) -> np.ndarray:
 # UI
 # ---------------------------------------------------------------------------
 
+def _load_step_info(res, total: int) -> np.ndarray:
+    """Массив [nsets, 2] со step/substep. Совместимо с разными версиями API."""
+    try:
+        ls = res._resultheader["ls_table"]
+        return np.asarray(ls).reshape(total, -1)[:, :2]
+    except (KeyError, AttributeError, IndexError, ValueError):
+        info = []
+        for i in range(min(total, 30)):
+            try:
+                si = res.solution_info(i)
+                info.append([si.get("time_step", 0), si.get("sub_time_step", 0)])
+            except Exception:
+                info.append([0, 0])
+        return np.array(info, dtype=int) if info else np.zeros((0, 2), int)
+
+
 def choose_record(res: Result, interactive: bool, rnum: int | None) -> int:
     total = res.nsets
     if rnum is not None:
@@ -219,11 +230,11 @@ def choose_record(res: Result, interactive: bool, rnum: int | None) -> int:
         return rnum
     if not interactive or total <= 1:
         return total - 1
-    ls_table = res._resultheader["ls_table"]
+    steps = _load_step_info(res, total)
     times = res.time_values
     print("\nДоступные записи результатов:")
     for i in range(min(total, 30)):
-        step, sub = int(ls_table[i, 0]), int(ls_table[i, 1])
+        step, sub = int(steps[i, 0]), int(steps[i, 1])
         print(f"  [{i:>4}] step={step:>4} substep={sub:>4}  time={times[i]:.6g}")
     sel = input(f"Номер записи (0..{total-1}, по умолчанию {total-1}): ").strip()
     return int(sel) if sel else total - 1
@@ -321,9 +332,9 @@ def main(argv=None) -> int:
     table = np.hstack(cols)
 
     times = res.time_values
-    ls = res._resultheader["ls_table"]
+    steps = _load_step_info(res, res.nsets)
     print(f"\nФайл: {os.path.basename(args.rst)} | запись #{rnum} "
-          f"(step={int(ls[rnum,0])}, substep={int(ls[rnum,1])}, time={times[rnum]:.6g})"
+          f"(step={int(steps[rnum,0])}, substep={int(steps[rnum,1])}, time={times[rnum]:.6g})"
           f" | name selection: {chosen} | узлов с данными: {nnum.size}"
           + (f" | без данных: {missing}" if missing else ""))
 
