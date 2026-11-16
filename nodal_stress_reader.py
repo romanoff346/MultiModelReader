@@ -99,7 +99,11 @@ def read_components_from_rst(rst_path: str) -> dict[str, np.ndarray]:
             return {}
         node_comp, elem_comp = res._read_components()
     finally:
-        res._file.close()  # не держим дескриптор/память
+        # В reader >=0.28 (ANSYS 2022 R2) дескриптор — res._cfile (Cython Frf);
+        # атрибута _file нет. Явно НЕ закрываем его повторно: двойной close
+        # приводит к segfault в __del__ (AnsysBinary). Обнуляем ссылку —
+        # ресурс освободит сборщик мусора.
+        res._cfile = None
     print(f"[тайминг] чтение CM из RST ({maxcomp} записей): "
           f"{(time.perf_counter()-t0)*1e3:.0f} мс")
 
@@ -144,14 +148,14 @@ def gather_components(rst_path: str, archive: str | None,
 # ---------------------------------------------------------------------------
 
 def open_result(rst_path: str) -> Result:
-    """Открывает RST максимально быстро: mesh читается, VTK-разбор отключён.
+    """Открывает RST максимально быстро: сетка читается, VTK НЕ разбирается.
 
-    В ansys-mapdl-reader (все версии, включая 2022 R2 / reader 0.28+) фильтр
-    `nodes=` в nodal_stress опирается на VTK-сетку, построение которой на
-    больших моделях занимает минуты. Поэтому напряжения читаются полным
-    массивом ENS и фильтруются векторизованным numpy — это быстрее любого
-    VTK-пути. Если в установленной версии полный ENS без VTK недоступен
-    (AttributeError), автоматически включается parse_vtk=True.
+    Построение VTK UnstructuredGrid (`parse_vtk=True`) на больших моделях
+    занимает минуты; здесь оно отключено, а напряжения читаются напрямую
+    через Cython-ридер `_binary_reader.read_nodal_values` (см.
+    ``extract_stresses``) с той же математикой усреднения по узлам, что и
+    штатный ``nodal_stress``. Это проверенно идентично (max diff = 0)
+    эталонному пути в ansys-mapdl-reader (0.28+ ... 0.56, ANSYS 2022 R2).
     """
     t0 = time.perf_counter()
     res = Result(rst_path, read_mesh=True, parse_vtk=False)
@@ -160,28 +164,78 @@ def open_result(rst_path: str) -> Result:
     return res
 
 
+def _fast_nodal_stress(res: Result, rnum: int) -> tuple[np.ndarray, np.ndarray]:
+    """Полные узловые напряжения (nnum, stress[n,6]) БЕЗ разбора VTK-сетки.
+
+    Прямой вызов Cython-ридера ENS + деление на число вкладов элементов —
+    эквивалент ``res.nodal_stress(rnum)`` при ``grid=None``. Совместимо с
+    ansys-mapdl-reader 0.28+ (ANSYS 2022 R2); при изменении внутреннего API
+    бросает AttributeError/ImportError — вызывающий включает запасной путь.
+    """
+    from ansys.mapdl.reader import _binary_reader
+    from ansys.mapdl.reader.misc import vtk_cell_info
+    from ansys.mapdl.reader.rst import ELEMENT_INDEX_TABLE_KEYS
+
+    if getattr(res, "_mesh", None) is None:
+        raise AttributeError("mesh не загружен (read_mesh=False)")
+
+    # минимальный линейный грид нужен ридеру только для celltypes/offset/cells;
+    # строим его один раз (быстрее полного parse_vtk: без координат/fix_midside)
+    grid = getattr(res, "_fast_grid", None)
+    if grid is None:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            grid = res._mesh._parse_vtk(null_unallowed=True,
+                                        fix_midside=False).linear_copy()
+        res._fast_grid = grid
+    cells, offset = vtk_cell_info(grid)
+
+    rnum = res.parse_step_substep(rnum)
+    ele_ind_table, ans_etype, ptr_off = res._element_solution_header(rnum)
+    nitem = res._result_nitem(rnum, "ENS")
+    result_index = ELEMENT_INDEX_TABLE_KEYS.index("ENS")
+
+    data, ncount = _binary_reader.read_nodal_values(
+        res.filename, grid.celltypes, ele_ind_table, offset, cells,
+        nitem, grid.n_points, res._nodstr.copy(), ans_etype,
+        res._mesh.etype, result_index, ptr_off, False)
+
+    if nitem != 6:
+        data = data[:, :6]
+
+    mask = res._insolution  # узлы, реально присутствующие в решении
+    ncount = ncount[mask].reshape(-1, 1)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        stress = data[mask] / ncount
+    return np.ascontiguousarray(res._mesh.nnum[mask]), stress
+
+
 def extract_stresses(res: Result, rnum: int,
                      node_numbers: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Напряжения [n,6] только для узлов name selection (векторный numpy-фильтр).
 
-    Чтение полного ENS идёт напрямую через Cython-ридер без триангуляции/VTK;
-    выборка узлов — O(N) searchsorted. Возвращает (nnum, stress).
+    Выборка узлов — O(N) searchsorted по отсортированным номерам узлов
+    решения. Возвращает (nnum, stress). Если внутренний быстрый путь
+    недоступен (другая версия reader), автоматически используется штатный
+    ``nodal_stress`` с построением VTK.
     """
     sel = np.unique(node_numbers.astype(np.int32))
     t0 = time.perf_counter()
     try:
-        nnum_all, stress_all = res.nodal_stress(rnum)
-    except AttributeError:
-        # очень старые версии reader: ENS без VTK-грида не читается
+        nnum_all, stress_all = _fast_nodal_stress(res, rnum)
+    except (AttributeError, ImportError, TypeError):
         print("[предупреждение] быстрый путь недоступен в этой версии "
               "ansys-mapdl-reader, включаю разбор VTK...")
+        if getattr(res, "grid", None) is None:
+            res._store_mesh(parse_vtk=True)
         nnum, stress = res.nodal_stress(rnum, nodes=sel)
         print(f"[тайминг] извлечение напряжений через VTK ({sel.size} узлов): "
               f"{(time.perf_counter()-t0)*1e3:.0f} мс")
         return nnum, stress
     # узлы решения отсортированы по номеру → быстрая выборка
-    found = sel[np.isin(sel, nnum_all)]
-    idx = np.searchsorted(nnum_all, found)
+    pos = np.searchsorted(nnum_all, sel)
+    ok = (pos < nnum_all.size) & (nnum_all[np.clip(pos, 0, nnum_all.size - 1)] == sel)
+    idx = pos[ok]
     nnum, stress = nnum_all[idx], stress_all[idx]
     print(f"[тайминг] извлечение напряжений ({sel.size} узлов выбрано, "
           f"{nnum.size} с данными): {(time.perf_counter()-t0)*1e3:.0f} мс")
@@ -189,9 +243,19 @@ def extract_stresses(res: Result, rnum: int,
 
 
 def principal_stresses(stress: np.ndarray) -> np.ndarray:
-    """Главные напряжения S1>=S2>=S3 и von Mises (пакетный eigvalsh)."""
-    sx, sy, sz, sxy, syz, sxz = stress.T
-    t = np.zeros((stress.shape[0], 9), dtype=np.float64)
+    """Главные напряжения S1>=S2>=S3 и von Mises (пакетный eigvalsh).
+
+    Строки с NaN/Inf (узлы без данных) возвращаются как NaN — eigvalsh на
+    них не вызывается (иначе LinAlgError / зависание LAPACK).
+    """
+    n = stress.shape[0]
+    out = np.full((n, 4), np.nan)
+    ok = np.isfinite(stress).all(axis=1)
+    if not ok.any():
+        return out
+    s = stress[ok].astype(np.float64)
+    sx, sy, sz, sxy, syz, sxz = s.T
+    t = np.zeros((s.shape[0], 9), dtype=np.float64)
     t[:, 0], t[:, 4], t[:, 8] = sx, sy, sz
     t[:, 1] = t[:, 3] = sxy
     t[:, 5] = t[:, 7] = syz
@@ -199,7 +263,8 @@ def principal_stresses(stress: np.ndarray) -> np.ndarray:
     eig = np.linalg.eigvalsh(t.reshape(-1, 3, 3))[:, ::-1]
     s1, s2, s3 = eig.T
     mises = np.sqrt(0.5 * ((s1 - s2) ** 2 + (s2 - s3) ** 2 + (s1 - s3) ** 2))
-    return np.column_stack([eig, mises])
+    out[ok] = np.column_stack([eig, mises])
+    return out
 
 
 # ---------------------------------------------------------------------------
