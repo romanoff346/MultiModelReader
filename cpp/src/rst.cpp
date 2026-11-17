@@ -2,7 +2,7 @@
 #include "rst.h"
 
 #include <algorithm>
-#include <strings.h>   // strcasecmp
+// (strcasecmp не используется; избегаем POSIX-специфичных заголовков ради MSVC)
 
 namespace rst {
 

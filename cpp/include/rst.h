@@ -16,9 +16,73 @@
 #include <string>
 #include <vector>
 
+// ---- кроссплатформенный позиционный ввод (SSD-friendly, без общего seek) ----
+#if defined(_WIN32)
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#else
+  #include <fcntl.h>
+  #include <unistd.h>
+#endif
+
 namespace rst {
 
 constexpr int kWord = 4;
+
+// Нативный файловый дескриптор для pread-подобного чтения
+using NativeFd =
+#if defined(_WIN32)
+    HANDLE;
+#else
+    int;
+#endif
+
+inline NativeFd fd_open(const std::string& p) {
+#if defined(_WIN32)
+    return ::CreateFileA(p.c_str(), GENERIC_READ,
+                         FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+                         nullptr);
+#else
+    return ::open(p.c_str(), O_RDONLY);
+#endif
+}
+inline void fd_close(NativeFd fd) {
+#if defined(_WIN32)
+    if (fd != INVALID_HANDLE_VALUE) ::CloseHandle(fd);
+#else
+    if (fd >= 0) ::close(fd);
+#endif
+}
+inline bool fd_valid(NativeFd fd) {
+#if defined(_WIN32)
+    return fd != INVALID_HANDLE_VALUE;
+#else
+    return fd >= 0;
+#endif
+}
+// Чтение count байт по абсолютному смещению без изменения позиции файла.
+// Возвращает true, если прочитано ровно count байт.
+inline bool fd_pread(NativeFd fd, void* dst, size_t count, int64_t offset) {
+#if defined(_WIN32)
+    OVERLAPPED ov{};
+    LARGE_INTEGER li; li.QuadPart = offset;
+    ov.Offset = li.u.LowPart;
+    ov.OffsetHigh = li.u.HighPart;
+    DWORD got = 0;
+    if (!::ReadFile(fd, dst, (DWORD)count, &got, &ov)) return false;
+    return got == (DWORD)count;
+#else
+    size_t done = 0;
+    while (done < count) {
+        ssize_t n = ::pread(fd, (char*)dst + done, count - done, offset + (int64_t)done);
+        if (n <= 0) return false;
+        done += (size_t)n;
+    }
+    return true;
+#endif
+}
 
 inline int64_t rd_i64(const uint8_t* p) {
     int64_t v; std::memcpy(&v, p, 8); return v;
