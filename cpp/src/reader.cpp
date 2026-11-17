@@ -1,12 +1,10 @@
 // reader.cpp — параллельное чтение наборов результатов из .rst
 //
 // Модель параллелизма: каждый поток берёт из очереди свой набор (set) и
-// читает его целиком через независимый файловый дескриптор + POSIX pread()
-// (файл на SSD, случайные позиционные чтения масштабируются почти линейно).
+// читает его целиком через независимый файловый дескриптор + позиционное
+// чтение без общего seek (pread() в POSIX / ReadFile(OVERLAPPED) в Win32).
+// Файл на SSD, случайные позиционные чтения масштабируются почти линейно.
 #include "reader.h"
-
-#include <fcntl.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <cmath>
@@ -21,21 +19,24 @@ namespace rst {
 namespace {
 
 struct PreadCtx {
-    int fd = -1;
+    NativeFd fd =
+#if defined(_WIN32)
+        INVALID_HANDLE_VALUE;
+#else
+        -1;
+#endif
     std::vector<uint8_t> buf;     // сырой кадр: [4][body][4]
     int64_t words = 0;            // длина тела в словах
     const uint8_t* body() const { return buf.data() + 4; }
 
     bool read(int64_t word_off, std::string& err) {
         int32_t len = 0;
-        ssize_t n = ::pread(fd, &len, 4, word_off * kWord);
-        if (n != 4) { err = "pread reclen"; return false; }
+        if (!fd_pread(fd, &len, 4, word_off * kWord)) { err = "pread reclen"; return false; }
         if (len <= 0 || len > (1 << 28)) { err = "bad reclen " + std::to_string(len); return false; }
         size_t total = 8 + (size_t)len * kWord;
         buf.resize(total);
         memcpy(buf.data(), &len, 4);
-        n = ::pread(fd, buf.data() + 4, total - 8, word_off * kWord + 4);
-        if ((size_t)n != total - 8) { err = "pread body"; return false; }
+        if (!fd_pread(fd, buf.data() + 4, total - 8, word_off * kWord + 4)) { err = "pread body"; return false; }
         int32_t len2; memcpy(&len2, buf.data() + 4 + (size_t)len * kWord, 4);
         if (len2 != len) { err = "reclen mismatch"; return false; }
         words = len;
@@ -55,20 +56,37 @@ inline int64_t f64_as_word(const uint8_t* p, int64_t idx) {
 SetData read_set(File& meta, int set_index, const std::vector<int32_t>* node_filter) {
     SetData out; out.set_index = set_index;
     PreadCtx c;
-    c.fd = ::open(meta.path.c_str(), O_RDONLY);
-    if (c.fd < 0) { out.err = "open failed"; return out; }
+    c.fd = fd_open(meta.path.c_str());
+    if (!fd_valid(c.fd)) { out.err = "open failed"; return out; }
     std::string err;
 
     const ResultSet& rs = meta.sets[set_index];
 
-    // 1. Заголовок решения (RSPEC по RPNTR): смещения таблиц внутри набора
-    if (!c.read(rs.rpointer_words, err)) { out.err = "RSPEC: " + err; ::close(c.fd); return out; }
-    const uint8_t* hdr = c.body();
-    // RSPEC: [0]=не исп., [1]=DofBlk — таблица заголовков DOF (смещение в словах, REAL*8)
-    const int64_t ptr_dof_table = f64_as_word(hdr, 1);
+    // 1. Заголовок решения (RSPEC по RPNTR): смещения таблиц внутри набора.
+    //    RSPEC может быть записан как несколько коротких FORTRAN-записей
+    //    (например, по 2 слова) — читаем подряд до получения DofBlk (slot 1).
+    int64_t hdr_words = 0;                 // длина тела в словах
+    std::vector<uint8_t> hdrbuf;           // склеенное тело [4][body][4]
+    int64_t cur = rs.rpointer_words;
+    int64_t ptr_dof_table = -1;
+    for (int guard = 0; guard < 16; ++guard) {
+        if (!c.read(cur, err)) { out.err = "RSPEC: " + err; fd_close(c.fd); return out; }
+        size_t old = hdrbuf.size();
+        hdrbuf.resize(old + (size_t)c.words * kWord);
+        memcpy(hdrbuf.data() + old, c.body(), (size_t)c.words * kWord);
+        hdr_words += c.words;
+        if (hdr_words >= 2) {              // slot[1] доступен
+            ptr_dof_table = f64_as_word(hdrbuf.data(), 1);
+            break;
+        }
+        cur += c.words + 2;                // следующая запись на диске
+    }
+    if (ptr_dof_table <= 0) { out.err = "RSPEC: bad DofBlk"; fd_close(c.fd); return out; }
+    const uint8_t* hdr = hdrbuf.data();
+    (void)hdr;
 
     // 2. Таблица DOF: для каждого узлового DOF — тип, номер узла, смещение данных
-    if (!c.read(ptr_dof_table, err)) { out.err = "DOF table: " + err; ::close(c.fd); return out; }
+    if (!c.read(ptr_dof_table, err)) { out.err = "DOF table: " + err; fd_close(c.fd); return out; }
     struct DofInfo { int32_t node; int64_t data_word; };
     std::vector<DofInfo> ux, uy, uz, sxy, syz, sxz;
     int32_t max_node_seen = 0;
@@ -129,7 +147,7 @@ SetData read_set(File& meta, int set_index, const std::vector<int32_t>* node_fil
 
     bool ok = load_component(IUX, 0) && load_component(IUY, 1) && load_component(IUZ, 2)
            && load_component(ISX, 3) && load_component(ISY, 4) && load_component(ISZ, 5);
-    ::close(c.fd);
+    fd_close(c.fd);
     out.ok = ok;
     if (!ok) out.err = err;
     return out;
