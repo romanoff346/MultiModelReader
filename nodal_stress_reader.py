@@ -5,21 +5,28 @@ nodal_stress_reader.py — быстрое чтение узловых напря
 
 Программа НЕ требует установленного ANSYS: используется быстрый бинарный
 ридер ansys-mapdl-reader (Cython + numpy). Имена name selections и списки
-узлов читаются напрямую из заголовков RST-файла (без построения VTK-меша),
-напряжения извлекаются нативным фильтром ридера `nodes=` — он читает с диска
-только элементы, содержащие узлы выбранного компонента.
+узлов/элементов читаются напрямую из заголовков RST-файла (без построения
+VTK-меша), напряжения извлекаются только для узлов выбранного компонента.
+
+Поддерживаются ОБА типа name selections:
+  * узловые (NODE)  — используются как есть;
+  * элементные (ELEM/ELEMENT) — автоматически раскрываются в узлы:
+    собираются все узлы, принадлежащие элементам компонента (по таблице
+    связности элементов EBLOCK/RST-mesh). Ключ --elems-only ограничивает
+    выборку узлами ТОЛЬКО элементных компонентов.
 
 Источники name selections (пробуются по порядку):
   1. Файл результатов (.rst/.rnn)          — если модель сохранена с CM
      (MAPDL: `CMSLV,PICK` + `CM,...,N` до сохранения или /POST1 с CMSflg=1)
-  2. Архив модели / CDB-файл (.cdb/.arc/.txt) — блок *CM,N,...
-     Передаётся ключом --archive; если не задан, автоматически ищется
-     одноимённый .cdb рядом с RST.
+  2. Архив модели / CDB-файл (.cdb/.arc/.txt) — блоки *CM,...,NODE / *CM,...,ELEM
+     и CMBLOCK. Передаётся ключом --archive; если не задан, автоматически
+     ищется одноимённый .cdb рядом с RST.
 
 Примеры:
     python nodal_stress_reader.py file.rst                       # интерактивно
-    python nodal_stress_reader.py file.rst --list                # список CM
+    python nodal_stress_reader.py file.rst --list                # список CM (N/E)
     python nodal_stress_reader.py file.rst -a model.cdb -c FIXTURE_NODES -t 5 --mises
+    python nodal_stress_reader.py file.rst -c MY_ELEMS --mises   # эл. компонент -> узлы
     python nodal_stress_reader.py file.rst -a model.cdb --select # выбрать из списка
 """
 
@@ -50,13 +57,92 @@ STRESS_LABELS = ["SX", "SY", "SZ", "SXY", "SYZ", "SXZ"]
 # Чтение name selections (components)
 # ---------------------------------------------------------------------------
 
+def _expand_cm_ranges(items: list[int]) -> np.ndarray:
+    """Раскрывает компактный формат *CM: отрицательное число N означает
+    диапазон от предыдущего номера +1 до |N| (стандартная запись MAPDL)."""
+    out: list[int] = []
+    prev = 0
+    for v in items:
+        if v > 0:
+            out.append(v)
+            prev = v
+        else:
+            out.extend(range(prev + 1, abs(v) + 1))
+            prev = abs(v)
+    return np.array(out, dtype=np.int32)
+
+
+def parse_cm_blocks_text(cdb_path: str) -> tuple[dict, dict]:
+    """Запасной текстовый разбор блоков '*CM,name,N/E,n1,n2,...' из CDB.
+
+    Используется, если штатный Cython-парсер Archive не нашёл компоненты
+    (например, CDWRITE в формате COMP с инлайновыми списками или старая
+    версия ansys-mapdl-reader). Continuation-строки после заголовка *CM
+    поддерживаются; строки, начинающиеся с '+', пропускаются как форматы.
+    Возвращает (node_comps, elem_comps).
+    """
+    node_comps: dict[str, list[int]] = {}
+    elem_comps: dict[str, list[int]] = {}
+    try:
+        with open(cdb_path, "r", errors="ignore") as f:
+            lines = f.readlines()
+    except OSError:
+        return {}, {}
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if s.upper().startswith("*CM,"):
+            parts = [p.strip() for p in s[4:].split(",")]
+            if len(parts) >= 3 and parts[0]:
+                name = parts[0].upper()
+                ctype = parts[1].upper()
+                vals: list[int] = []
+                for tok in parts[2:]:
+                    try:
+                        vals.append(int(tok))
+                    except ValueError:
+                        pass  # счётчик nnodes/nnamlen и пр. — не номера
+                j = i + 1
+                # continuation-строки: только цифры/запятые/пробелы/минус
+                while j < len(lines):
+                    c = lines[j].strip()
+                    if not c or c.startswith(("*", "+", "!", "/", "$")):
+                        break
+                    got_any = False
+                    for tok in c.replace(",", " ").split():
+                        try:
+                            vals.append(int(tok))
+                            got_any = True
+                        except ValueError:
+                            break
+                    if not got_any:
+                        break
+                    j += 1
+                arr = _expand_cm_ranges(vals)
+                if ctype.startswith("N"):
+                    node_comps.setdefault(name, []).extend(arr.tolist())
+                elif ctype.startswith("E"):
+                    elem_comps.setdefault(name, []).extend(arr.tolist())
+                i = j
+                continue
+        i += 1
+    return ({k: np.unique(np.asarray(v, np.int32)) for k, v in node_comps.items()},
+            {k: np.unique(np.asarray(v, np.int32)) for k, v in elem_comps.items()})
+
+
 def read_components_from_archive(cdb_path: str) -> dict[str, np.ndarray]:
-    """Разбирает блоки '*CM,NAME,N,...' из архива/CDB модели.
+    """Разбирает блоки '*CM,NAME,N/E,...' и CMBLOCK из архива/CDB модели.
 
     Совместимо со всеми версиями pymapdl-reader: используется публичный класс
     ``Archive`` (ansys-mapdl-core 0.6.x / reader 0.28+, ANSYS 2022 R2) и
-    запасной вариант ``MapdlBinaryReader`` для очень старых версий.
+    запасной вариант ``MapdlBinaryReader`` для очень старых версий. Если
+    штатный парсер не нашёл ни одного компонента, включается собственный
+    текстовый разбор ``parse_cm_blocks_text``.
     Чтение быстрое: parse_vtk=False — без построения VTK-сетки.
+
+    Узловые компоненты возвращаются в словаре, ЭЛЕМЕНТНЫЕ сохраняются в
+    атрибуте функции ``element_components`` (для последующего раскрытия
+    в узлы по таблице связности).
     """
     comps_raw = elem_raw = None
     try:
@@ -69,12 +155,19 @@ def read_components_from_archive(cdb_path: str) -> dict[str, np.ndarray]:
         comps_raw, elem_raw = reader._node_comps, reader._elem_comps
 
     comps = {}
-    for name, nodes in comps_raw.items():
+    for name, nodes in (comps_raw or {}).items():
         key = name.strip().upper()
         if key:
             comps[key] = np.asarray(nodes, dtype=np.int32)
     elem_comps = {k.strip().upper(): np.asarray(v, dtype=np.int32)
-                  for k, v in (elem_raw or {}).items()}
+                  for k, v in (elem_raw or {}).items() if k.strip()}
+
+    # запасной текстовый парсер — если штатный ничего не нашёл
+    if not comps and not elem_comps:
+        t_nodes, t_elems = parse_cm_blocks_text(cdb_path)
+        comps.update(t_nodes)
+        elem_comps.update(t_elems)
+
     read_components_from_archive.element_components = elem_comps
     return comps
 
@@ -119,10 +212,18 @@ def read_components_from_rst(rst_path: str) -> dict[str, np.ndarray]:
 
 
 def gather_components(rst_path: str, archive: str | None,
-                      verbose: bool = True) -> tuple[dict[str, np.ndarray], str]:
-    """Собирает name selections из RST и/или архива. Возвращает (comps, source)."""
+                      verbose: bool = True
+                      ) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray], str]:
+    """Собирает name selections из RST и/или архива.
+
+    Возвращает (node_comps, elem_comps, source): узловые и ЭЛЕМЕНТНЫЕ
+    компоненты (имена — верхний регистр). При одинаковых именах узловое
+    определение имеет приоритет; элементное при этом удаляется, чтобы
+    избежать неоднозначности.
+    """
     t0 = time.perf_counter()
-    comps = read_components_from_rst(rst_path)
+    node_comps = read_components_from_rst(rst_path)
+    elem_comps = dict(getattr(read_components_from_rst, "element_components", {}))
     src = "RST"
     # архив: явный ключ или автопоиск одноимённого .cdb
     cands = [archive] if archive else []
@@ -131,16 +232,50 @@ def gather_components(rst_path: str, archive: str | None,
         cands = [base + ".cdb", base + ".arc"]
     for c in cands:
         if c and os.path.isfile(c):
-            arc_comps = read_components_from_archive(c)
-            if arc_comps:
-                for k, v in arc_comps.items():
-                    comps.setdefault(k, v)
+            arc_nodes = read_components_from_archive(c)
+            arc_elems = getattr(read_components_from_archive,
+                                "element_components", {})
+            if arc_nodes or arc_elems:
+                for k, v in arc_nodes.items():
+                    node_comps.setdefault(k, v)
+                for k, v in arc_elems.items():
+                    elem_comps.setdefault(k, v)
                 src = os.path.basename(c)
                 break
+    # устраняем коллизию имён: узловой компонент важнее элементного
+    for k in list(elem_comps):
+        if k in node_comps:
+            del elem_comps[k]
     if verbose:
         print(f"[тайминг] разбор name selections: {(time.perf_counter()-t0)*1e3:.0f} мс"
-              f" (источник: {src}, найдено: {len(comps)})")
-    return comps, src
+              f" (источник: {src}, узловых: {len(node_comps)},"
+              f" элементных: {len(elem_comps)})")
+    return node_comps, elem_comps, src
+
+
+def expand_elem_to_nodes(elem_numbers: np.ndarray, mesh) -> np.ndarray:
+    """Узлы всех элементов с заданными номерами (по таблице связности Mesh).
+
+    Векторная реализация через ``mesh.elem`` / ``mesh._elem_off`` без
+    построения VTK-сетки. Возвращает отсортированный массив номеров узлов.
+    """
+    enum = np.asarray(mesh.enum, dtype=np.int64)
+    sel = np.unique(np.asarray(elem_numbers, dtype=np.int64))
+    pos = np.searchsorted(enum, sel)
+    ok = (pos < enum.size) & (enum[np.clip(pos, 0, max(enum.size - 1, 0))] == sel)
+    if not ok.any():
+        return np.zeros(0, dtype=np.int32)
+    eoff = np.asarray(mesh._elem_off, dtype=np.int64)
+    elem = np.asarray(mesh._elem)
+    starts, ends = eoff[pos[ok]], eoff[pos[ok] + 1]
+    lengths = ends - starts
+    # узлы элемента — позиции 10..n в строке E-format (после 10 служебных полей)
+    total = int(lengths.sum())
+    idx = np.repeat(starts + 10, np.maximum(lengths - 10, 0)) \
+        + np.concatenate([np.arange(l - 10) for l in lengths if l > 10]) \
+        if total else np.zeros(0, dtype=np.int64)
+    nodes = elem[idx]
+    return np.unique(nodes[nodes > 0]).astype(np.int32)
 
 
 # ---------------------------------------------------------------------------
@@ -306,27 +441,43 @@ def choose_record(res: Result, interactive: bool, rnum: int | None) -> int:
 
 
 def select_component(interactive: bool, chosen: str | None,
-                     components: dict[str, np.ndarray]) -> str:
-    names = sorted(components)
+                     node_comps: dict[str, np.ndarray],
+                     elem_comps: dict[str, np.ndarray]
+                     ) -> tuple[str, str]:
+    """Выбор name selection. Возвращает (имя, тип), тип: 'NODE' или 'ELEM'."""
+    names = sorted(node_comps) + sorted(elem_comps)
     if not names:
         sys.exit("Name selections не найдены. Сохраните компоненты в RST "
                  "(CMSLV,PICK + CM,...,N) или укажите архив модели ключом --archive.")
+    def resolve(key: str) -> tuple[str, str] | None:
+        if key in node_comps:
+            return key, "NODE"
+        if key in elem_comps:
+            return key, "ELEM"
+        return None
     if chosen is not None:
-        key = chosen.strip().upper()
-        if key not in components:
+        got = resolve(chosen.strip().upper())
+        if got is None:
             sys.exit(f"Компонент '{chosen}' не найден. Доступные: {', '.join(names)}")
-        return key
+        return got
     if not interactive:
         sys.exit("Укажите name selection ключом --component/-c (неинтерактивный режим).")
-    print("\nName selections (компоненты узлов):")
-    for i, n in enumerate(names, start=1):
-        print(f"  [{i:>3}] {n:<32} узлов: {components[n].size}")
+    print("\nName selections:")
+    i = 0
+    for n in sorted(node_comps):
+        i += 1
+        print(f"  [{i:>3}] {n:<32} узловой   узлов: {node_comps[n].size}")
+    for n in sorted(elem_comps):
+        i += 1
+        print(f"  [{i:>3}] {n:<32} элементный элементов: {elem_comps[n].size}"
+              f"  (узлы берутся из этих элементов)")
     while True:
         sel = input("Выберите name selection (номер или имя): ").strip()
         if sel.isdigit() and 1 <= int(sel) <= len(names):
-            return names[int(sel) - 1]
-        if sel.upper() in components:
-            return sel.upper()
+            return resolve(names[int(sel) - 1])
+        got = resolve(sel.upper())
+        if got:
+            return got
         print("Неверный ввод, попробуйте ещё раз.")
 
 
@@ -340,7 +491,10 @@ def main(argv=None) -> int:
                    help="только вывести список name selections")
     p.add_argument("--select", action="store_true",
                    help="только выбрать name selection (интерактивно)")
-    p.add_argument("-c", "--component", help="имя name selection (без диалога)")
+    p.add_argument("-c", "--component", help="имя name selection, узлового или "
+                                             "элементного (без диалога)")
+    p.add_argument("--elems-only", action="store_true",
+                   help="учитывать только элементные name selections")
     p.add_argument("-t", "--time", "--rnum", dest="rnum", type=int,
                    help="номер записи результатов (0-based)")
     p.add_argument("--principal", action="store_true",
@@ -359,30 +513,51 @@ def main(argv=None) -> int:
     interactive = sys.stdin.isatty() and not args.no_input
 
     # 1. Список name selections (быстрый парсер заголовков, без VTK)
-    components, _src = gather_components(args.rst, args.archive)
+    node_comps, elem_comps, _src = gather_components(args.rst, args.archive)
+    if args.elems_only:
+        node_comps = {}
 
     if args.list:
-        if not components:
+        if not node_comps and not elem_comps:
             sys.exit("Name selections не найдены (см. справку --help).")
         print("\nName selections:")
-        for n in sorted(components):
-            print(f"  {n:<32} узлов: {components[n].size}")
+        for n in sorted(node_comps):
+            print(f"  {n:<32} узловой    узлов: {node_comps[n].size}")
+        for n in sorted(elem_comps):
+            print(f"  {n:<32} элементный элементов: {elem_comps[n].size}")
         return 0
 
-    # 2. Выбор name selection
-    chosen = select_component(interactive, args.component, components)
+    # 2. Выбор name selection (узлового или элементного)
+    chosen, ctype = select_component(interactive, args.component,
+                                     node_comps, elem_comps)
     if args.select:
-        print(f"Выбрано: {chosen}")
+        print(f"Выбрано: {chosen} ({'узловой' if ctype == 'NODE' else 'элементный'})")
         return 0
 
-    # 3. Открытие RST (без меша — максимально быстро)
+    # 3. Открытие RST (сетка без разбора VTK — максимально быстро)
     res = open_result(args.rst)
     rnum = choose_record(res, interactive, args.rnum)
 
-    # 4. Напряжения только для узлов выбранного name selection
-    nnum, stress = extract_stresses(res, rnum, components[chosen])
+    # 4. Узлы для расчёта: узловой компонент как есть; элементный —
+    #    все узлы, принадлежащие элементам компонента
+    if ctype == "NODE":
+        sel_nodes = node_comps[chosen]
+        kind = f"{chosen} (узловых)"
+    else:
+        t0 = time.perf_counter()
+        sel_nodes = expand_elem_to_nodes(elem_comps[chosen], res._mesh)
+        print(f"[тайминг] раскрытие элементного компонента '{chosen}' "
+              f"({elem_comps[chosen].size} элементов -> {sel_nodes.size} узлов): "
+              f"{(time.perf_counter()-t0)*1e3:.0f} мс")
+        if sel_nodes.size == 0:
+            sys.exit(f"Элементы компонента '{chosen}' не найдены в сетке RST "
+                     "(проверьте номера или загрузку EBLOCK из архива).")
+        kind = f"{chosen} (элементный, {elem_comps[chosen].size} эл. -> {sel_nodes.size} уз.)"
 
-    missing = int(np.setdiff1d(np.unique(components[chosen]), nnum).size)
+    # 5. Напряжения только для узлов выбранного name selection
+    nnum, stress = extract_stresses(res, rnum, sel_nodes)
+
+    missing = int(np.setdiff1d(np.unique(sel_nodes), nnum).size)
 
     header = ["Node"] + STRESS_LABELS
     cols = [nnum[:, None].astype(np.float64), stress]
@@ -400,7 +575,7 @@ def main(argv=None) -> int:
     steps = _load_step_info(res, res.nsets)
     print(f"\nФайл: {os.path.basename(args.rst)} | запись #{rnum} "
           f"(step={int(steps[rnum,0])}, substep={int(steps[rnum,1])}, time={times[rnum]:.6g})"
-          f" | name selection: {chosen} | узлов с данными: {nnum.size}"
+          f" | name selection: {kind} | узлов с данными: {nnum.size}"
           + (f" | без данных: {missing}" if missing else ""))
 
     limit = args.head if args.head > 0 else max(table.shape[0], 1)
