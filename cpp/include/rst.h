@@ -9,8 +9,10 @@
 // отчитываются явной ошибкой (можно подключить zlib-декомпрессор).
 #pragma once
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -65,6 +67,10 @@ public:
     // Возвращает тело записи в buf (без маркеров длины); words_out — длина в словах.
     bool read_record(int64_t word_off, std::vector<uint8_t>& buf,
                      int64_t& words_out, std::string& err);
+
+    // Найти запись результата по номеру substep (1-based) или по времени.
+    int find_set_by_substep(int substep) const;
+    int find_set_by_time(double time, double tol = 1e-9) const;
 };
 
 } // namespace rst
