@@ -75,6 +75,7 @@ tprnt_off = b.add(bytes(tprnt))
 prsolf = b.add(f64(N_SETS, rpntr, tprnt_off))
 
 # --- перезапись первой записи: указатели таблиц ---
+# Layout: [1]=PTRPTR, [2]=PTRDAT, [3]=PRSOL, [4]=PTRGEO, [5]=PTRELM, [6]=PTRCMS
 new_rec1 = frame(f64(prsolf, ptrdat, prsolf, 0, 0, ptrcms))
 start = rec1_off * W
 old_len = len(frame(f64(0, 0, 0, 0, 0, 0)))

@@ -62,15 +62,13 @@ SetData read_set(File& meta, int set_index, const std::vector<int32_t>* node_fil
     const ResultSet& rs = meta.sets[set_index];
 
     // 1. Заголовок решения (RSPEC по RPNTR): смещения таблиц внутри набора
-    if (!c.read(rs.rpointer_words, err)) { out.err = err; ::close(c.fd); return out; }
+    if (!c.read(rs.rpointer_words, err)) { out.err = "RSPEC: " + err; ::close(c.fd); return out; }
     const uint8_t* hdr = c.body();
-    // layout (i64): [0]=не исп., [1]=DofBlk(таблица DOF-заголовков), [2]=LOCF,
-    //               [3]=EIG, [4]=GEO, [5]=FORC, [6]=MASS, ...
-    // Указатели в RSPEC хранятся как int64 (в словах от начала файла).
-    const int64_t ptr_dof_table = rd_i64(hdr + 8);      // элемент [1]
+    // RSPEC: [0]=не исп., [1]=DofBlk — таблица заголовков DOF (смещение в словах, REAL*8)
+    const int64_t ptr_dof_table = f64_as_word(hdr, 1);
 
     // 2. Таблица DOF: для каждого узлового DOF — тип, номер узла, смещение данных
-    if (!c.read(ptr_dof_table, err)) { out.err = err; ::close(c.fd); return out; }
+    if (!c.read(ptr_dof_table, err)) { out.err = "DOF table: " + err; ::close(c.fd); return out; }
     struct DofInfo { int32_t node; int64_t data_word; };
     std::vector<DofInfo> ux, uy, uz, sxy, syz, sxz;
     int32_t max_node_seen = 0;

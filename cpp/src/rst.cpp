@@ -41,6 +41,7 @@ bool File::open(const std::string& p, std::string& err) {
     auto ptr = [&](int idx) -> int64_t {           // idx — 1-й элемент Фортрана
         return (int64_t)llround(rd_f64(b.data() + (idx - 1) * 8));
     };
+    // Layout: [1]=PTRPTR, [2]=PTRDAT, [3]=PRSOL, [4]=PTRGEO, [5]=PTRELM, [6]=PTRCMS
     const int64_t ptr_ptr      = ptr(1); (void)ptr_ptr;   // таблица указателей (манифест)
     const int64_t ptr_data     = ptr(2);   // таблица данных
     const int64_t ptr_solution = ptr(3);   // таблица решений (RSPEC)
