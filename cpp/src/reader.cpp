@@ -16,31 +16,25 @@
 namespace rst {
 
 // ---- вспомогательный ридер FORTRAN-записей поверх pread (без общего seek) ----
+// read_pread в rst.cpp прозрачно распаковывает сжатые записи ANSCOMP и кэширует
+// распакованные тела, поэтому параллельные потоки читают сжатый файл корректно.
 namespace {
 
 struct PreadCtx {
+    File* meta = nullptr;
     NativeFd fd =
 #if defined(_WIN32)
         INVALID_HANDLE_VALUE;
 #else
         -1;
 #endif
-    std::vector<uint8_t> buf;     // сырой кадр: [4][body][4]
-    int64_t words = 0;            // длина тела в словах
-    const uint8_t* body() const { return buf.data() + 4; }
+    std::vector<uint8_t> body_buf;  // распакованное тело записи
+    int64_t words = 0;              // длина тела в словах
+    const uint8_t* body() const { return body_buf.data(); }
 
     bool read(int64_t word_off, std::string& err) {
-        int32_t len = 0;
-        if (!fd_pread(fd, &len, 4, word_off * kWord)) { err = "pread reclen"; return false; }
-        if (len <= 0 || len > (1 << 28)) { err = "bad reclen " + std::to_string(len); return false; }
-        size_t total = 8 + (size_t)len * kWord;
-        buf.resize(total);
-        memcpy(buf.data(), &len, 4);
-        if (!fd_pread(fd, buf.data() + 4, total - 8, word_off * kWord + 4)) { err = "pread body"; return false; }
-        int32_t len2; memcpy(&len2, buf.data() + 4 + (size_t)len * kWord, 4);
-        if (len2 != len) { err = "reclen mismatch"; return false; }
-        words = len;
-        return true;
+        words = meta->read_pread(fd, word_off, body_buf, err);
+        return words >= 0;
     }
 };
 
@@ -56,6 +50,7 @@ inline int64_t f64_as_word(const uint8_t* p, int64_t idx) {
 SetData read_set(File& meta, int set_index, const std::vector<int32_t>* node_filter) {
     SetData out; out.set_index = set_index;
     PreadCtx c;
+    c.meta = &meta;
     c.fd = fd_open(meta.path.c_str());
     if (!fd_valid(c.fd)) { out.err = "open failed"; return out; }
     std::string err;

@@ -4,15 +4,19 @@
 // Все смещения в заголовках указаны в 4-байтных словах (word = 4 байта).
 // Запись на диске: [int32 reclen_words][body][int32 reclen_words].
 //
-// Ограничение версии: поддерживаются НЕсжатые RST (MAPDL OUTRES,NOCOMPRESS
-// или ANSYS < 19). Сжатые записи (ZLIB/ANSYS-словарь) распознаются и
-// отчитываются явной ошибкой (можно подключить zlib-декомпрессор).
+// Поддерживаются как НЕсжатые RST (MAPDL OUTRES,...,NOCOMPRESS / COMPRESS,OFF),
+// так и СЖАТЫЕ записи формата ANSCOMP (OUTRES,...,,ANSYS; по умолчанию в MAPDL
+// >= 2023 R1): сжатая FORTRAN-запись помечается магическим словом 'ANS-' в
+// начале тела и распаковывается встроенным DEFLATE-декодером (zlite.cpp),
+// внешняя библиотека zlib не требуется.
 #pragma once
 
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -28,6 +32,14 @@
 namespace rst {
 
 constexpr int kWord = 4;
+
+// Магическое слово сжатой FORTRAN-записи ANSYS (ANSCOMP): первые 8 байт
+// тела — 'ANS-' + номер версии формата ('1'..'3'). reclen при этом = длина
+// СЖАТОГО кадра.
+inline bool is_comp_magic(const void* p) {
+    const uint8_t* b = (const uint8_t*)p;
+    return std::memcmp(b, "ANS-", 4) == 0 && b[4] >= '1' && b[4] <= '9';
+}
 
 // Нативный файловый дескриптор для pread-подобного чтения
 using NativeFd =
@@ -149,14 +161,30 @@ private:
     int64_t file_bytes_ = 0;                        // размер файла для границ обхода
     int64_t nelem_hint_ = 0;                        // оценка числа элементов
 
+    // ---- поддержка сжатых записей (ANSCOMP) ----
+    bool compressed_ = false;                       // файл содержит сжатые записи
+    // Кэш распакованных записей: word_off -> тело без padding. Нужен потому,
+    // что смещения указателей в ANSCOMP-файлах — это адреса СЖАТЫХ кадров,
+    // а таблицы внутри набора склеиваются из нескольких записей подряд
+    // ("off += words + 2" работает только при известной распакованной длине).
+    std::map<int64_t, std::vector<uint8_t>> unc_cache_;
+    mutable std::mutex unc_mtx_;
+
 public:
     FILE* fp = nullptr;
     std::string path;
+    bool compressed() const { return compressed_; }
 
     // Прочитать одну FORTRAN-запись по словесному смещению.
     // Возвращает тело записи в buf (без маркеров длины); words_out — длина в словах.
     bool read_record(int64_t word_off, std::vector<uint8_t>& buf,
                      int64_t& words_out, std::string& err);
+
+    // То же, но через потокобезопасный позиционный ввод (для reader.cpp),
+    // с прозрачной декомпрессией ANSCOMP-записей и кэшем распакованных тел.
+    // out — тело без padding; возвращает длину тела в словах (-1 при ошибке).
+    int64_t read_pread(NativeFd fd, int64_t word_off, std::vector<uint8_t>& out,
+                       std::string& err);
 
     // Найти запись результата по номеру substep (1-based) или по времени.
     int find_set_by_substep(int substep) const;

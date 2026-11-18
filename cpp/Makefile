@@ -3,7 +3,7 @@ CXX      ?= g++
 CXXFLAGS += -std=c++20 -O3 -march=native -Wall -Wextra -Iinclude
 LDFLAGS  += -pthread
 
-SRC := src/rst.cpp src/reader.cpp src/main.cpp
+SRC := src/rst.cpp src/reader.cpp src/zlite.cpp src/main.cpp
 OBJ := $(SRC:.cpp=.o)
 BIN := rst_reader
 
