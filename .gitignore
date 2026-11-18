@@ -1,4 +1,1 @@
-*.o
-*.out
-__pycache__/
-*.pyc
+cpp/rst_reader

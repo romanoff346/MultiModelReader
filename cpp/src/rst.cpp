@@ -10,7 +10,7 @@ namespace rst {
 
 namespace {
 
-constexpr size_t kAnscHdr = 21;   // magic(9)+orig_len(4)+nchunks(4)+chunk_lens(4*n)
+constexpr size_t kAnscHdr = 20;   // magic(8)+orig_len(4)+nchunks(4), далее lens 4*n
 
 // Распаковать тело сжатой FORTRAN-записи ANSYS (ANSCOMP).
 // body — кадр ПОСЛЕ int32 reclen: [magic 'ANS-'...][orig_len][nchunks]
@@ -21,8 +21,8 @@ bool ansc_uncompress(const uint8_t* body, size_t body_bytes,
                      std::vector<uint8_t>& out) {
     if (body_bytes < kAnscHdr) return false;
     const uint8_t* p = body;
-    int32_t orig_len = rd_i32(p + 9);
-    int32_t nchunks  = rd_i32(p + 13);
+    int32_t orig_len = rd_i32(p + 12);
+    int32_t nchunks  = rd_i32(p + 16);
     if (orig_len <= 0 || nchunks <= 0 || nchunks > (1 << 20)) return false;
     if ((size_t)nchunks * 4 + kAnscHdr > body_bytes) return false;
     size_t pos = kAnscHdr + (size_t)nchunks * 4;
@@ -30,7 +30,7 @@ bool ansc_uncompress(const uint8_t* body, size_t body_bytes,
     out.reserve((size_t)orig_len);
     std::vector<uint8_t> tmp;
     for (int32_t i = 0; i < nchunks; ++i) {
-        const int32_t clen = rd_i32(p + 17 + (size_t)i * 4);   // длина chunk'а (<0 = literal)
+        const int32_t clen = rd_i32(p + 20 + (size_t)i * 4);   // длина chunk'а (<0 = literal)
         if (clen == 0) continue;                    // пустой chunk
         if (clen < 0) {                             // literal chunk (не сжался)
             size_t lsz = (size_t)(-clen);
@@ -51,16 +51,82 @@ bool ansc_uncompress(const uint8_t* body, size_t body_bytes,
 
 } // namespace
 
+// Определить единицу измерения маркеров длины: классический FORTRAN хранит
+// reclen в 4-байтовых СЛОВАХ; некоторые сборки (и генераторы ANSCOMP) пишут
+// его в БАЙТАХ. Определяем по первой записи: пробуем слова, при несовпадении
+// маркеров или магике — байты. Результат запоминается в reclen_bytes_.
+void File::detect_reclen_unit() {
+    if (reclen_bytes_ != 0) return;                   // уже определено
+    if (!fp || file_bytes_ < 12) return;
+    int32_t n = 0;
+    std::fseek(fp, 0, SEEK_SET);
+    if (std::fread(&n, 4, 1, fp) != 1 || n <= 0) return;
+    // гипотеза "слова"
+    bool words_ok = false;
+    if ((int64_t)n * kWord + 8 <= file_bytes_) {
+        std::vector<uint8_t> body((size_t)n * kWord);
+        if (std::fread(body.data(), 1, body.size(), fp) == body.size()) {
+            int32_t post = 0;
+            if (std::fread(&post, 4, 1, fp) == 1 && post == n)
+                words_ok = !is_comp_magic(body.data());   // сжатая запись со словами-маркером подозрительна
+        }
+    }
+    // гипотеза "байты"
+    bool bytes_ok = false;
+    if (n >= 8 && (int64_t)n + 8 <= file_bytes_) {
+        std::fseek(fp, 4, SEEK_SET);
+        std::vector<uint8_t> body((size_t)n);
+        if (std::fread(body.data(), 1, body.size(), fp) == body.size()) {
+            int32_t post = 0;
+            if (std::fread(&post, 4, 1, fp) == 1 && post == n)
+                bytes_ok = true;
+        }
+    }
+    if (!words_ok && bytes_ok)
+        reclen_bytes_ = 1;                            // маркеры в байтах
+    else
+        reclen_bytes_ = -1;                           // маркеры в словах (классика)
+    std::fseek(fp, 0, SEEK_END);                      // восстановить позицию
+}
+
+// Размер СЖАТОГО кадра на диске (в словах) по словесному смещению; кэшируется.
+// Используется для перехода к следующей физической записи, когда указатели
+// внутри набора идут по адресам сжатых кадров неизвестной распакованной длины.
+int64_t File::frame_words_at(int64_t word_off) {
+    {
+        std::lock_guard<std::mutex> lk(unc_mtx_);
+        auto it = comp_frame_words_.find(word_off);
+        if (it != comp_frame_words_.end()) return it->second;
+    }
+    const int64_t byte_off = word_off * kWord;
+    if (!fp || byte_off + 8 > file_bytes_) return -1;
+    int32_t len_pre = 0;
+    long saved = std::ftell(fp);
+    if (std::fseek(fp, (long)byte_off, SEEK_SET) != 0) return -1;
+    if (std::fread(&len_pre, 4, 1, fp) != 1 || len_pre <= 0) {
+        std::fseek(fp, saved, SEEK_SET); return -1;
+    }
+    const int64_t body_bytes = reclen_bytes_ == 1 ? (int64_t)len_pre
+                                                  : (int64_t)len_pre * kWord;
+    std::fseek(fp, saved, SEEK_SET);
+    const int64_t frame_words = body_bytes / kWord;
+    std::lock_guard<std::mutex> lk(unc_mtx_);
+    comp_frame_words_[word_off] = frame_words;
+    return frame_words;
+}
+
 // Прочитать одну FORTRAN-запись по словесному смещению (body без маркеров длины).
 // Если запись сжата (магик 'ANS-'), прозрачно распаковывается.
 bool File::read_record(int64_t word_off, std::vector<uint8_t>& buf,
                        int64_t& words_out, std::string& err) {
+    detect_reclen_unit();
     const int64_t byte_off = word_off * kWord;
     int32_t len_pre = 0;
     if (std::fseek(fp, (long)byte_off, SEEK_SET) != 0) { err = "fseek fail"; return false; }
     if (std::fread(&len_pre, 4, 1, fp) != 1) { err = "read reclen fail"; return false; }
     if (len_pre <= 0) { err = "bad record length " + std::to_string(len_pre); return false; }
-    const int64_t body_bytes = (int64_t)len_pre * kWord;
+    const int64_t body_bytes = reclen_bytes_ == 1 ? (int64_t)len_pre
+                                                  : (int64_t)len_pre * kWord;
     buf.resize((size_t)body_bytes);
     if (std::fread(buf.data(), 1, (size_t)body_bytes, fp) != (size_t)body_bytes) {
         err = "read body fail"; return false;
@@ -79,6 +145,7 @@ bool File::read_record(int64_t word_off, std::vector<uint8_t>& buf,
         {   // кладём в кэш для read_pread (тот же адрес -> то же тело)
             std::lock_guard<std::mutex> lk(unc_mtx_);
             unc_cache_[word_off] = unc;             // копия
+            comp_frame_words_[word_off] = body_bytes / kWord;
         }
         words_out = (int64_t)unc.size() / kWord;
         buf = std::move(unc);
@@ -86,7 +153,7 @@ bool File::read_record(int64_t word_off, std::vector<uint8_t>& buf,
     }
 
     if (len_post != len_pre) { err = "record markers mismatch"; return false; }
-    words_out = len_pre;
+    words_out = body_bytes / kWord;
     return true;
 }
 
@@ -99,11 +166,12 @@ int64_t File::read_pread(NativeFd fd, int64_t word_off, std::vector<uint8_t>& ou
         auto it = unc_cache_.find(word_off);
         if (it != unc_cache_.end()) { out = it->second; return (int64_t)out.size() / kWord; }
     }
+    const int64_t rb = reclen_bytes_;               // снимок (детект выполнен в open)
     const int64_t byte_off = word_off * kWord;
     int32_t len_pre = 0;
     if (!fd_pread(fd, &len_pre, 4, byte_off)) { err = "pread reclen"; return -1; }
     if (len_pre <= 0 || len_pre > (1 << 28)) { err = "bad reclen " + std::to_string(len_pre); return -1; }
-    const int64_t body_bytes = (int64_t)len_pre * kWord;
+    const int64_t body_bytes = rb == 1 ? (int64_t)len_pre : (int64_t)len_pre * kWord;
     std::vector<uint8_t> raw((size_t)body_bytes);
     if (!fd_pread(fd, raw.data(), (size_t)body_bytes, byte_off + 4)) { err = "pread body"; return -1; }
     int32_t len_post = 0;
@@ -119,13 +187,14 @@ int64_t File::read_pread(NativeFd fd, int64_t word_off, std::vector<uint8_t>& ou
         {
             std::lock_guard<std::mutex> lk(unc_mtx_);
             unc_cache_[word_off] = unc;             // копия в кэш
+            comp_frame_words_[word_off] = body_bytes / kWord;
         }
         out = std::move(unc);
         return (int64_t)out.size() / kWord;
     }
     if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
     out = std::move(raw);                           // несжатая запись: тело как есть
-    return len_pre;
+    return body_bytes / kWord;
 }
 
 void File::close() {
@@ -141,6 +210,7 @@ bool File::open(const std::string& p, std::string& err) {
     std::fseek(fp, 0, SEEK_SET);
 
     // ---- Запись 1: указатели на таблицы заголовка ----
+    detect_reclen_unit();                           // слова/байты в маркерах длины
     std::vector<uint8_t> b; int64_t w = 0;
     if (!read_record(0, b, w, err)) return false;
     auto ptr = [&](int idx) -> int64_t {           // idx — 1-й элемент Фортрана
@@ -185,7 +255,14 @@ bool File::open(const std::string& p, std::string& err) {
             sets[i].substep = rd_i32(b.data() + r * 12 + 4);
             sets[i].time    = (double)rd_i32(b.data() + r * 12 + 8);
         }
-        off += w + 2;                                 // пропуск маркеров длины
+        // Смещение следующей ФИЗИЧЕСКОЙ записи: для сжатых кадров длина на
+        // диске отличается от распакованной — берём размер кадра из кэша.
+        int64_t phys_words = w;
+        if (compressed_) {
+            int64_t fw = frame_words_at(off);
+            if (fw > 0) phys_words = fw;
+        }
+        off += phys_words + 2;                        // пропуск маркеров длины
     }
 
     // ---- Компоненты (name selections): узловые и элементные группы ----

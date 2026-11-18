@@ -30,10 +30,12 @@ struct PreadCtx {
 #endif
     std::vector<uint8_t> body_buf;  // распакованное тело записи
     int64_t words = 0;              // длина тела в словах
+    int64_t last_frame_words = 0;   // физический размер прочитанного кадра (слов)
     const uint8_t* body() const { return body_buf.data(); }
 
     bool read(int64_t word_off, std::string& err) {
         words = meta->read_pread(fd, word_off, body_buf, err);
+        if (words >= 0) last_frame_words = meta->frame_words_at(word_off);
         return words >= 0;
     }
 };
@@ -74,7 +76,7 @@ SetData read_set(File& meta, int set_index, const std::vector<int32_t>* node_fil
             ptr_dof_table = f64_as_word(hdrbuf.data(), 1);
             break;
         }
-        cur += c.words + 2;                // следующая запись на диске
+        cur += (c.last_frame_words > 0 ? c.last_frame_words : c.words) + 2; // следующая ФИЗИЧЕСКАЯ запись на диске
     }
     if (ptr_dof_table <= 0) { out.err = "RSPEC: bad DofBlk"; fd_close(c.fd); return out; }
     const uint8_t* hdr = hdrbuf.data();
