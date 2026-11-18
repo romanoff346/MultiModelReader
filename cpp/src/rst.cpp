@@ -1,12 +1,58 @@
 // rst.cpp — реализация заголовочного парсера и параллельного чтения .rst
+// (включая СЖАТЫЕ файлы формата ANSCOMP: OUTRES,...,,ANSYS / COMPRESS,ON)
 #include "rst.h"
+#include "zlite.h"
 
 #include <algorithm>
 // (strcasecmp не используется; избегаем POSIX-специфичных заголовков ради MSVC)
 
 namespace rst {
 
-// Прочитать одну FORTRAN-запись по словесному смещению (body без маркеров длины)
+namespace {
+
+constexpr size_t kAnscHdr = 21;   // magic(9)+orig_len(4)+nchunks(4)+chunk_lens(4*n)
+
+// Распаковать тело сжатой FORTRAN-записи ANSYS (ANSCOMP).
+// body — кадр ПОСЛЕ int32 reclen: [magic 'ANS-'...][orig_len][nchunks]
+//        [chunk_len * n][данные chunk'ов]; возвращает распакованное тело
+//        без хвостового padding. Поддерживаются zlib- deflate-потоки
+//        (chunk_len > 0) и literal-ные chunk'и (chunk_len <= 0).
+bool ansc_uncompress(const uint8_t* body, size_t body_bytes,
+                     std::vector<uint8_t>& out) {
+    if (body_bytes < kAnscHdr) return false;
+    const uint8_t* p = body;
+    int32_t orig_len = rd_i32(p + 9);
+    int32_t nchunks  = rd_i32(p + 13);
+    if (orig_len <= 0 || nchunks <= 0 || nchunks > (1 << 20)) return false;
+    if ((size_t)nchunks * 4 + kAnscHdr > body_bytes) return false;
+    size_t pos = kAnscHdr + (size_t)nchunks * 4;
+    out.clear();
+    out.reserve((size_t)orig_len);
+    std::vector<uint8_t> tmp;
+    for (int32_t i = 0; i < nchunks; ++i) {
+        const int32_t clen = rd_i32(p + 17 + (size_t)i * 4);   // длина chunk'а (<0 = literal)
+        if (clen == 0) continue;                    // пустой chunk
+        if (clen < 0) {                             // literal chunk (не сжался)
+            size_t lsz = (size_t)(-clen);
+            if (pos + lsz > body_bytes) return false;
+            out.insert(out.end(), p + pos, p + pos + lsz);
+            pos += lsz;
+        } else {
+            if (pos + (size_t)clen > body_bytes) return false;
+            if (!zl::inflate_zlib(p + pos, (size_t)clen, tmp)) return false;
+            out.insert(out.end(), tmp.begin(), tmp.end());
+            pos += (size_t)clen;
+        }
+    }
+    if ((int32_t)out.size() < orig_len) return false;
+    out.resize((size_t)orig_len);                   // отбросить word-padding
+    return true;
+}
+
+} // namespace
+
+// Прочитать одну FORTRAN-запись по словесному смещению (body без маркеров длины).
+// Если запись сжата (магик 'ANS-'), прозрачно распаковывается.
 bool File::read_record(int64_t word_off, std::vector<uint8_t>& buf,
                        int64_t& words_out, std::string& err) {
     const int64_t byte_off = word_off * kWord;
@@ -21,9 +67,65 @@ bool File::read_record(int64_t word_off, std::vector<uint8_t>& buf,
     }
     int32_t len_post = 0;
     if (std::fread(&len_post, 4, 1, fp) != 1) { err = "read reclen2 fail"; return false; }
+
+    if (is_comp_magic(buf.data())) {                // ---- сжатая запись ANSCOMP ----
+        compressed_ = true;
+        if (len_post != len_pre) { err = "record markers mismatch"; return false; }
+        std::vector<uint8_t> unc;
+        if (!ansc_uncompress(buf.data(), (size_t)body_bytes, unc)) {
+            err = "decompress fail at word " + std::to_string(word_off);
+            return false;
+        }
+        {   // кладём в кэш для read_pread (тот же адрес -> то же тело)
+            std::lock_guard<std::mutex> lk(unc_mtx_);
+            unc_cache_[word_off] = unc;             // копия
+        }
+        words_out = (int64_t)unc.size() / kWord;
+        buf = std::move(unc);
+        return true;
+    }
+
     if (len_post != len_pre) { err = "record markers mismatch"; return false; }
     words_out = len_pre;
     return true;
+}
+
+// Потокобезопасное позиционное чтение одной записи с декомпрессией и кэшем.
+// Возвращает длину тела в словах или -1 при ошибке.
+int64_t File::read_pread(NativeFd fd, int64_t word_off, std::vector<uint8_t>& out,
+                         std::string& err) {
+    {   // быстрый путь: уже распаковано/кэшировано
+        std::lock_guard<std::mutex> lk(unc_mtx_);
+        auto it = unc_cache_.find(word_off);
+        if (it != unc_cache_.end()) { out = it->second; return (int64_t)out.size() / kWord; }
+    }
+    const int64_t byte_off = word_off * kWord;
+    int32_t len_pre = 0;
+    if (!fd_pread(fd, &len_pre, 4, byte_off)) { err = "pread reclen"; return -1; }
+    if (len_pre <= 0 || len_pre > (1 << 28)) { err = "bad reclen " + std::to_string(len_pre); return -1; }
+    const int64_t body_bytes = (int64_t)len_pre * kWord;
+    std::vector<uint8_t> raw((size_t)body_bytes);
+    if (!fd_pread(fd, raw.data(), (size_t)body_bytes, byte_off + 4)) { err = "pread body"; return -1; }
+    int32_t len_post = 0;
+    if (!fd_pread(fd, &len_post, 4, byte_off + 4 + body_bytes)) { err = "pread reclen2"; return -1; }
+
+    if (is_comp_magic(raw.data())) {                // ---- сжатая запись ----
+        if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
+        std::vector<uint8_t> unc;
+        if (!ansc_uncompress(raw.data(), (size_t)body_bytes, unc)) {
+            err = "decompress fail at word " + std::to_string(word_off);
+            return -1;
+        }
+        {
+            std::lock_guard<std::mutex> lk(unc_mtx_);
+            unc_cache_[word_off] = unc;             // копия в кэш
+        }
+        out = std::move(unc);
+        return (int64_t)out.size() / kWord;
+    }
+    if (len_post != len_pre) { err = "reclen mismatch"; return -1; }
+    out = std::move(raw);                           // несжатая запись: тело как есть
+    return len_pre;
 }
 
 void File::close() {
@@ -105,8 +207,11 @@ bool File::open(const std::string& p, std::string& err) {
         ptr_elem_words = ptr_elem;
         nelem_hint_ = n_elem_ptr;
     }
-    // ELMAP (обычно PTR(7)): [NELMAX][NELEM] — точное число элементов
-    const int64_t ptr_elmap = ptr(7);
+    // ELMAP: таблица указателей элементов. Смещение берём из PTRELM (slot 5),
+    // если это валидный адрес записи; иначе — из slot 7 (в некоторых раскладках).
+    int64_t ptr_elmap = ptr_elem;                   // адрес таблицы указателей эл-тов
+    auto valid_word = [&](int64_t v) { return v > 0 && v * kWord < file_bytes_; };
+    if (!valid_word(ptr_elmap)) ptr_elmap = ptr(7);
     if (ptr_elmap != 0 && read_record(ptr_elmap, b, w, err)) {
         int32_t nelmax = rd_i32(b.data() + 0);
         int32_t nelem  = rd_i32(b.data() + 4);
