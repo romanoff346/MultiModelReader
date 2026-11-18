@@ -160,22 +160,39 @@ int run_parallel(File& meta, Options opt) {   // копия opt — можно �
     if (nthreads <= 0) nthreads = 4;
     nthreads = std::min<int>(nthreads, (int)opt.sets.size());
 
-    // фильтр узлов по компоненту
+    // фильтр узлов по компоненту (узловой — напрямую; элементный — развертка в узлы)
     const std::vector<int32_t>* filter = nullptr;
+    std::vector<int32_t> expanded;               // хранение узлов для элементного блока
     if (!opt.component.empty()) {
+        const Component* found = nullptr;
         for (auto& c : meta.components)
-            if (c.name == opt.component) { filter = &c.nodes; break; }
-        if (!filter) {
+            if (c.name == opt.component) { found = &c; break; }
+        if (!found) {
             std::transform(opt.component.begin(), opt.component.end(),
                            opt.component.begin(), ::toupper);
             for (auto& c : meta.components)
-                if (c.name == opt.component) { filter = &c.nodes; break; }
+                if (c.name == opt.component) { found = &c; break; }
         }
-        if (!filter) {
+        if (!found) {
             std::fprintf(stderr, "Компонент '%s' не найден.\nДоступные:", opt.component.c_str());
-            for (auto& c : meta.components) std::fprintf(stderr, " %s", c.name.c_str());
+            for (auto& c : meta.components)
+                std::fprintf(stderr, " %s[%s]", c.name.c_str(),
+                             c.is_elem ? "ELEM" : "NODE");
             std::fprintf(stderr, "\n");
             return 1;
+        }
+        if (found->is_elem) {
+            std::string err;
+            if (!meta.expand_elem_component(*found, expanded, err)) {
+                std::fprintf(stderr, "Не удалось развернуть элементный компонент '%s': %s\n",
+                             found->name.c_str(), err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "Компонент '%s': %zu элементов -> %zu уникальных узлов\n",
+                         found->name.c_str(), found->elems.size(), expanded.size());
+            filter = &expanded;
+        } else {
+            filter = &found->nodes;
         }
     }
 
