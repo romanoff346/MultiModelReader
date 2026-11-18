@@ -70,8 +70,12 @@ int main(int argc, char** argv) {
             std::printf("%-6zu %-6d %-8d %.6g\n", i, f.sets[i].step,
                         f.sets[i].substep, f.sets[i].time);
         std::printf("\nName selections (%zu):\n", f.components.size());
-        for (auto& c : f.components)
-            std::printf("  %-32s %zu nodes\n", c.name.c_str(), c.nodes.size());
+        for (auto& c : f.components) {
+            if (c.is_elem)
+                std::printf("  %-32s %zu elems (elementary)\n", c.name.c_str(), c.elems.size());
+            else
+                std::printf("  %-32s %zu nodes\n", c.name.c_str(), c.nodes.size());
+        }
         if (opt.list) { f.close(); return 0; }
         std::printf("\nУкажите --set/--sets/--substep/--time.\n");
         f.close(); return 0;

@@ -40,14 +40,44 @@ def i32(*v): return struct.pack(f"<{len(v)}i", *v)
 N_NODES, N_SETS = 500, 8
 NAME = b"FIXTURE".ljust(8)               # NNAM = 8
 COMP_NODES = list(range(1, 101))
+# Элементная named selection: quad4-элементы из узлов 201..300 (сетка 10x10)
+ELEM_NAME = b"ELEMS".ljust(8)
 
 b = Builder()
-rec1_off = b.add(f64(0, 0, 0, 0, 0, 0))          # placeholder, перезапишем
-ptrdat = b.add(f64(N_NODES, 0, 1))
+rec1_off = b.add(f64(0, 0, 0, 0, 0, 0, 0))       # placeholder (7 слотов), перезапишем
+ptrdat = b.add(f64(N_NODES, 0, 2))               # Maxcomp = 2
 
-# --- компоненты ---
-cms_body = i32(1, len(NAME), len(COMP_NODES)) + NAME + b"\x00" + i32(len(COMP_NODES)) + i32(*COMP_NODES)
-if len(cms_body) % W: cms_body += b"\0" * (W - len(cms_body) % W)
+# --- геометрия/узлы: @PTRGEO [NELMAX][NELEM]... (упрощённо — только счётчики) ---
+# Таблица элементов: ELMAP = [NELMAX][NELEM], ELCONN = id + 8 нод на элемент
+elems = []            # (eid, [n1..n4])
+nid = lambda r, c: 201 + r * 10 + c
+for r in range(9):
+    for c in range(9):
+        elems.append((len(elems) + 1, [nid(r, c), nid(r, c + 1),
+                                       nid(r + 1, c + 1), nid(r + 1, c)]))
+elconn_body = bytearray()
+for eid, conn in elems:
+    row = conn + [0] * (8 - len(conn))
+    elconn_body += i32(*row)                      # 8 слов нод на элемент
+elmap_off_tmp = b.words                           # адрес ELMAP известен заранее
+elmap_body = i32(len(elems), len(elems)) + f64(elmap_off_tmp + 1)  # ptr ELCONN (в словах)
+elmap_off = b.add(elmap_body)
+elconn_off = b.add(bytes(elconn_body))
+ptrelm = b.add(f64(elmap_off))                    # PTRELM -> таблица указателей эл.
+
+# --- компоненты (узловой + элементный) ---
+def comp_block(names, types, lists):
+    ncms, nnam = len(names), max(len(n) for n in names)
+    body = i32(ncms, nnam, sum(len(l) for l in lists))
+    for nm in names: body += nm.ljust(nnam) + b"\x00"
+    for t in types:  body += t.ljust(4)           # маркеры типов 'N'/'E'
+    pad = (-len(body)) % W                        # выравнивание на слово
+    body += b"\x00" * pad
+    for l in lists:  body += i32(len(l)) + i32(*l)
+    if len(body) % W: body += b"\x00" * (W - len(body) % W)
+    return body
+
+cms_body = comp_block([NAME, ELEM_NAME], [b"N", b"E"], [COMP_NODES, [e[0] for e in elems]])
 ptrcms = b.add(cms_body)
 
 # --- наборы результатов ---
@@ -76,9 +106,9 @@ prsolf = b.add(f64(N_SETS, rpntr, tprnt_off))
 
 # --- перезапись первой записи: указатели таблиц ---
 # Layout: [1]=PTRPTR, [2]=PTRDAT, [3]=PRSOL, [4]=PTRGEO, [5]=PTRELM, [6]=PTRCMS
-new_rec1 = frame(f64(prsolf, ptrdat, prsolf, 0, 0, ptrcms))
+new_rec1 = frame(f64(prsolf, ptrdat, prsolf, 0, ptrelm, ptrcms, elmap_off))
 start = rec1_off * W
-old_len = len(frame(f64(0, 0, 0, 0, 0, 0)))
+old_len = len(frame(f64(0, 0, 0, 0, 0, 0, 0)))
 assert len(new_rec1) == old_len
 b.buf[start:start + old_len] = new_rec1
 

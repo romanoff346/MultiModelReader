@@ -103,8 +103,18 @@ struct ResultSet {
 };
 
 struct Component {
-    std::string name;             // name selection (32 символа)
-    std::vector<int32_t> nodes;   // узловые компоненты
+    std::string name;             // name selection (имя блока *CM)
+    std::vector<int32_t> nodes;   // заполняется для узловых компонентов
+    std::vector<int32_t> elems;   // заполняется для элементных компонентов
+    bool is_node = false;         // тип: узловой блок?
+    bool is_elem = false;         // тип: элементный блок?
+};
+
+// Таблица элементов: id ->Connectivity (1-based ids, ноды 1-based)
+struct ElemTable {
+    int32_t max_eid = 0;
+    std::vector<int32_t> e2n;     // [eid*8 .. eid*8+7] — ноды элемента (0 = нет)
+    std::vector<int32_t> ncomp;   // кол-во узлов на элемент
 };
 
 class File {
@@ -121,9 +131,25 @@ public:
 
     // Смещения таблиц геометрии (words)
     int64_t ptr_geo_words = 0;
+    int64_t ptr_elem_words = 0;   // таблица указателей элементов
     int64_t ptr_comp_words = 0;
     int32_t maxcomp = 0;
 
+    // Таблица связности элементов (заполняется лениво, load_elements())
+    ElemTable elem_tab;
+    bool elements_loaded = false;
+    bool load_elements(std::string& err);           // читает ELMAP/ELCONN
+    // Развернуть элементный компонент в уникальные отсортированные узлы
+    bool expand_elem_component(const Component& c, std::vector<int32_t>& out_nodes,
+                               std::string& err);
+
+private:
+    void parse_components(const uint8_t* p, int64_t total);
+    int32_t ncms_hdr = 0, nnam_hdr = 0;             // заголовок блока PTRCMS
+    int64_t file_bytes_ = 0;                        // размер файла для границ обхода
+    int64_t nelem_hint_ = 0;                        // оценка числа элементов
+
+public:
     FILE* fp = nullptr;
     std::string path;
 
