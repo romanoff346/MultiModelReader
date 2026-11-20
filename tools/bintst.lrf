@@ -1,0 +1,11 @@
+-out:bintst.exe
+-map:bintst.map
+-incremental:no
+-stack:0x6000000
+-machine:x64
+-subsystem:console
+-manifest:embed
+-defaultlib:binlib.lib
+bintst.obj
+bintrd.obj
+bintwr.obj
